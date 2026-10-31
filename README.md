@@ -244,7 +244,8 @@ the sync-preset writes and the card in SoundBase are still to be checked.
   coordination view has to go through SoundBase's own Shure AD4 integration, which talks to the unit
   directly and so bypasses this plugin's "Require Showlink For Frequency" lock.
 
-- macOS only for now; the code has not been run elsewhere.
+- Run against a unit on macOS only. Windows x64 is declared: the test suite
+  and the boot smoke check pass there, but no unit has been driven from it yet.
 - One controller per unit is the safe assumption: running this beside Wireless
   Workbench on the same AD4Q has not been tried.
 - The battery reading is the unit's best-identified field for it and has not
