@@ -227,6 +227,18 @@ the same device settings. The differences this plugin handles:
   (1.0.16.0 lacked it, 1.2.18.0 has it). Without it, transmitter details come
   from the ACN bank alone.
 
+**Firmware.** Two ANX4s on firmware 1.0.33.1 and 1.1.7.0 (before command
+strings existed) restarted about every 45 minutes while this plugin's session
+was open to them, and reconnecting only began the next cycle (2026-11-02). The
+plugin now reads the firmware first and sends no string-keyed request (the
+licence, the antenna pairs, the transmission mode) to a unit below 1.2.0: the
+channel count is taken one name at a time, and those three features are
+absent on such a unit. A unit that drops its session twice in ten minutes
+without having been asked to restart is left alone for fifteen minutes, with
+the reason in the plugin log, rather than reconnected into another restart.
+Whether that is enough for the older firmware has not been tried; 1.2.18.0 is
+the firmware this plugin was built against, and updating is the safe answer.
+
 Status: read on a real ANX4 licensed for 16 channels (2026-10-28, firmware
 1.2.18.0): discovery, the session, every channel's properties, meters and sync
 presets, the antenna pairs, the device settings; a full read takes about 3.5 s

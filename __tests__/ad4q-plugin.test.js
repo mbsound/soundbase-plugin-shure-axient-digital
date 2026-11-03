@@ -153,6 +153,24 @@ test('the ANX4 is a product per licensed channel count, 1 to 24, on the AD4Q til
   assert.equal(manifest.products.length, 26);
 });
 
+test('a unit that drops its session twice in ten minutes is stood down for fifteen', async () => {
+  const { recordLoss, standDownUntil, resetLosses } = await import('../adapter.js');
+  resetLosses();
+  const t0 = 1_000_000;
+  assert.equal(recordLoss('net:10.0.0.9', t0), null, 'one loss is a fault to report, not a loop');
+  assert.equal(standDownUntil('net:10.0.0.9', t0 + 1000), null);
+  const until = recordLoss('net:10.0.0.9', t0 + 5 * 60_000);
+  assert.equal(until, t0 + 5 * 60_000 + 15 * 60_000);
+  assert.equal(standDownUntil('net:10.0.0.9', t0 + 10 * 60_000), until);
+  assert.equal(standDownUntil('net:10.0.0.9', until + 1), null, 'over when it is over');
+  assert.equal(recordLoss('net:10.0.0.9', until + 60_000), null, 'the window starts afresh');
+  assert.equal(recordLoss('net:10.0.0.9', until + 11 * 60_000 + 1), null, 'a loss outside the window does not count with the earlier one');
+  const adapter = createMonitoringAdapter({ id: 'net:10.0.0.9', product: PRODUCT_ANX4(12), config: { host: '10.0.0.9' } }, {});
+  recordLoss('net:10.0.0.9'); recordLoss('net:10.0.0.9');
+  await assert.rejects(adapter.open(), /standing down/, 'no session is opened while standing down');
+  resetLosses();
+});
+
 test('a setting the model does not offer is refused before it reaches the unit', () => {
   const host = { config: { host: '192.0.2.10' } };
   const anx4 = createMonitoringAdapter({ id: 'net:192.0.2.10', product: PRODUCT_ANX4(16), ...host }, {});

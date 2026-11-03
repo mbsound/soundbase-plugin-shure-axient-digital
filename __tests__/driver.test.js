@@ -310,6 +310,36 @@ test('an ANX4 is read for the channels it is licensed for, counted from the unit
   assert.equal((await device.readAll()).channels[1].band, null);
 });
 
+test('an ANX4 below the string-key firmware floor is never sent a string-keyed request', async (t) => {
+  const { versionAtLeast, STRING_KEYS_FROM } = await import('../driver/ad4q/properties.js');
+  assert.equal(versionAtLeast('1.2.18.0', STRING_KEYS_FROM), true);
+  assert.equal(versionAtLeast('1.1.7.0', STRING_KEYS_FROM), false);
+  assert.equal(versionAtLeast('1.0.33.1', STRING_KEYS_FROM), false);
+  assert.equal(versionAtLeast(undefined, STRING_KEYS_FROM), false);
+  const slpPort = await freeUdpPort();
+  const fake = new FakeAd4q({ slpPort, model: 'ANX4', channels: 12, firmware: '1.1.7.0' });
+  await fake.listen();
+  const browser = new SlpBrowser({ port: slpPort, multicast: false, filter: isReceiverAdvert });
+  t.after(async () => { browser.stop(); await fake.stop(); });
+  await browser.find('127.0.0.1', 3000);
+  const device = new Ad4qDevice({ host: '127.0.0.1', browser, localIp: '127.0.0.1', advert: false, timings: { sendGapMs: 2, connectTimeoutMs: 4000 } });
+  t.after(() => device.close());
+  const strings = [];
+  await device.connect();
+  fake.commands; // the control port is not part of this
+  device.on('string', (e) => strings.push(e));
+  assert.equal(device.firmware, '1.1.7.0');
+  assert.equal(device.stringKeys, false);
+  assert.equal(device.channels, 12, 'counted one name at a time, up to the first refusal');
+  const all = await device.readAll();
+  assert.equal(all.device.firmware, '1.1.7.0');
+  assert.equal(all.channels[1].antenna, null);
+  assert.equal(all.device.transmissionMode, null);
+  assert.equal((await device.getKeys(['LICENSE:RF_CHANNEL_COUNT'])).size, 0);
+  await assert.rejects(device.setAntenna(1, 'CD'), /firmware/);
+  assert.equal(strings.length, 0, 'no string-keyed exchange reached the unit');
+});
+
 test('a unit nothing advertises is reported by address, not left to time out silently', async () => {
   const browser = new SlpBrowser({ port: await freeUdpPort(), multicast: false });
   const device = new Ad4qDevice({ host: '127.0.0.1', browser: { find: () => browser.find('127.0.0.1', 200) } });
