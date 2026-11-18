@@ -150,8 +150,13 @@ export class ControllerAdvert {
     socket.on('error', (err) => this.log('warn', `SLP advert socket: ${err.message}`));
     await new Promise((resolve) => {
       socket.once('error', resolve);
+      socket.once('close', resolve);
       socket.bind({ port: SLP_PORT, address: '0.0.0.0' }, resolve);
     });
+    if (this.socket !== socket) {
+      try { socket.close(); } catch {}
+      return;
+    }
     try {
       socket.setMulticastTTL(4);
       socket.setMulticastInterface(this.localIp);
@@ -160,9 +165,11 @@ export class ControllerAdvert {
       this.log('warn', `SLP multicast setup: ${err.message}`);
     }
     for (let i = 0; i < 3; i += 1) {
+      if (this.socket !== socket) return;
       this.#send();
       await new Promise((r) => setTimeout(r, 120));
     }
+    if (this.socket !== socket) return;
     this.timer = setInterval(() => this.#send(), 4000);
     this.timer.unref?.();
   }
@@ -241,8 +248,13 @@ export class SlpBrowser extends EventEmitter {
     socket.on('message', (data, rinfo) => this.#heard(data, rinfo));
     const bound = await new Promise((resolve) => {
       socket.once('error', () => resolve(false));
+      socket.once('close', () => resolve(false));
       socket.bind({ port: this.port, address: '0.0.0.0' }, () => resolve(true));
     });
+    if (this.socket !== socket) {
+      try { socket.close(); } catch {}
+      return;
+    }
     if (!bound) {
       this.socket = null;
       try {

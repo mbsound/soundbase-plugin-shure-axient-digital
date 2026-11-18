@@ -459,17 +459,21 @@ export class Ad4qDevice extends EventEmitter {
     const results = new Map();
     const list = addrs.filter((a) => !this.absent.has(a));
     // round one: batched; a refusal the unit named is final, a silence is asked again
-    const waits = list.map((addr) => {
-      const answer = this.#await(addr, 'get', { quiet: true });
-      answer.promise.then(
-        (value) => results.set(addr, value),
-        (err) => { if (err instanceof ReadRefused) this.absent.add(addr); }
-      );
-      return answer;
-    });
+    const waits = [];
     try {
       for (let i = 0; i < list.length; i += BATCH) {
-        await this.session.send(dmpBatch(DMP.GET, list.slice(i, i + BATCH)));
+        const batch = list.slice(i, i + BATCH);
+        // Start each timeout when its batch is queued, not while earlier batches
+        // are still being paced. Large devices can take seconds to send a read.
+        for (const addr of batch) {
+          const answer = this.#await(addr, 'get', { quiet: true });
+          answer.promise.then(
+            (value) => results.set(addr, value),
+            (err) => { if (err instanceof ReadRefused) this.absent.add(addr); }
+          );
+          waits.push(answer);
+        }
+        await this.session.send(dmpBatch(DMP.GET, batch));
       }
     } catch (err) {
       for (const wait of waits) wait.cancel();

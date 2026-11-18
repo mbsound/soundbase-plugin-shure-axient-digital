@@ -320,8 +320,8 @@ const ANX4_PROBE_RETRY_MS = 60_000;
 const ANX4_RECOUNT_MS = 10 * 60_000;
 const anx4Probes = new Map(); // ip -> { cid, channels, name } | { cid, promise } | { cid, failedAt }
 export const resetAnx4Probes = () => anx4Probes.clear();
-async function probeAnx4(unit) {
-  const probe = new Ad4qDevice({ host: unit.ip, cid: unit.cid, port: unit.port, channels: MAX_CHANNELS, log });
+export async function probeAnx4(unit) {
+  const probe = new Ad4qDevice({ host: unit.ip, cid: unit.cid, port: unit.port, channels: MAX_CHANNELS, licensed: true, log });
   try {
     await probe.connect();
     const channels = await probe.countChannels();
@@ -585,6 +585,15 @@ class Ad4qMonitoringAdapter {
   }
 
   async open() {
+    try {
+      return await this.#open();
+    } catch (err) {
+      await this.close().catch(() => {});
+      throw err;
+    }
+  }
+
+  async #open() {
     if (this.hostError) throw this.hostError;
     const until = standDownUntil(this.device?.id);
     if (until) {
@@ -662,6 +671,10 @@ class Ad4qMonitoringAdapter {
       this.#retryCommands();
       return;
     }
+    if (this.closed) {
+      await client.close();
+      return;
+    }
     this.commands = client;
     this.commandRetryMs = null;
     client.on('rep', (rep) => this.#onCommandReport(rep));
@@ -687,6 +700,8 @@ class Ad4qMonitoringAdapter {
     }
     this.#setCondition('commands-unavailable', null);
     this.#applyCommandState();
+    // The adapter can close while the initial reads are in flight.
+    if (this.closed || this.commands !== client) return;
     // the channel quality is a metered value: one SAMPLE a second per channel lights the card's Q row
     try {
       for (let c = 1; c <= this.channels; c += 1) await client.setMeterRate(c, SAMPLE_MS);
@@ -1299,6 +1314,15 @@ class Ad4qSpectrumAdapter {
   }
 
   async open() {
+    try {
+      return await this.#open();
+    } catch (err) {
+      await this.close().catch(() => {});
+      throw err;
+    }
+  }
+
+  async #open() {
     if (this.hostError) throw this.hostError;
     const anx4 = ANX4_PRODUCT_RE.test(String(this.device?.product ?? ''));
     // the ANX4 has no per-channel scan trigger (its four antennas are shared) and its scan is not captured yet

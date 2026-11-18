@@ -548,3 +548,46 @@ test('a unit that starts a scan and streams nothing fails fast, saying what was 
   // and the unit is released: the next scan on the session runs
   device.scanning = false;
 });
+
+test('paced multi-batch reads do not time out before their batches are sent', async (t) => {
+  const { fake, device } = await connected(t, {
+    timings: { sendGapMs: 35, connectTimeoutMs: 4000 },
+    requestTimeoutMs: 100,
+  });
+  const addresses = [...fake.store.keys()].slice(0, 48);
+  let sends = 0;
+  const send = device.session.send.bind(device.session);
+  device.session.send = (...args) => { sends += 1; return send(...args); };
+  const values = await device.getMany(addresses);
+  assert.equal(values.size, addresses.length);
+  assert.equal(sends, Math.ceil(addresses.length / 8), 'no needless individual retries');
+});
+
+test('stopping an advert during startup does not restart its timer', async () => {
+  const { ControllerAdvert } = await import('../driver/acn/slp.js');
+  const advert = new ControllerAdvert({ advert: Buffer.from('test'), localIp: '127.0.0.1' });
+  const starting = advert.start();
+  await delay(30);
+  advert.stop();
+  await starting;
+  assert.equal(advert.socket, null);
+  assert.equal(advert.timer, null);
+});
+
+test('stopping a browser during startup leaves no solicitation timer', async () => {
+  const browser = new SlpBrowser({ port: await freeUdpPort(), multicast: false });
+  const starting = browser.start();
+  browser.stop();
+  await starting;
+  assert.equal(browser.socket, null);
+  assert.equal(browser.timer, null);
+});
+
+test('closing a session while its socket binds rejects the pending connection', async () => {
+  const session = new AcnSession({ host: '127.0.0.1', port: 9, deviceCid: Buffer.alloc(16, 1), localIp: '127.0.0.1', advert: false });
+  session.on('error', () => {});
+  const connecting = session.connect();
+  await session.close();
+  await assert.rejects(connecting, /closed while binding/);
+  assert.equal(session.socket, null);
+});
