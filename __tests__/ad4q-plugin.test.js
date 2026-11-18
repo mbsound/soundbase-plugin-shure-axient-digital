@@ -227,6 +227,23 @@ test('a name the unit cannot hold is reduced to what it can, not refused', () =>
   assert.equal(asciiName('plain', 31), 'plain');
 });
 
+test('the network adapter setting names where discovery multicasts, and an absent one means nowhere', async () => {
+  const { selectedInterface } = await import('../adapter.js');
+  const { localInterfaces } = await import('../driver/netutil.js');
+  assert.equal(selectedInterface({}), null, 'blank: every adapter');
+  assert.equal(selectedInterface({ networkInterface: '   ' }), null);
+  const absent = selectedInterface({ networkInterface: 'no-such-adapter0' });
+  assert.equal(absent.address, null, 'named but not present: nowhere, not everywhere');
+  const real = localInterfaces()[0];
+  if (real) {
+    assert.equal(selectedInterface({ networkInterface: real.name }).address, real.address);
+    assert.equal(selectedInterface({ networkInterface: ` ${real.address} ` }).name, real.name);
+  }
+  const field = manifest.pluginConfigFields.find((f) => f.id === 'networkInterface');
+  assert.equal(field.type, 'textinput');
+  assert.equal(field.default, '');
+});
+
 test('the adapter sizes itself to the product it is given', () => {
   const host = { config: { host: '192.0.2.10' } };
   assert.equal(createMonitoringAdapter({ id: 'net:192.0.2.10', product: PRODUCT_AD4D, ...host }, {}).channels, 2);

@@ -142,7 +142,7 @@ export class Ad4qDevice extends EventEmitter {
    * @param {{
    *   host: string, port?: number, cid?: string|null,
    *   browser?: { find(ip: string, ms: number): Promise<object|null> },
-   *   localIp?: string, advert?: boolean, timings?: object,
+   *   localIp?: string, advert?: boolean, timings?: object, preferredInterface?: object|null,
    *   requestTimeoutMs?: number, scanStallMs?: number, log?: (level: string, message: string) => void,
    * }} options
    */
@@ -160,8 +160,11 @@ export class Ad4qDevice extends EventEmitter {
     log = () => {},
     scanStallMs = 20_000,
     licensed = false,
+    preferredInterface = null,
   }) {
     super();
+    /** the adapter the plugin is set to use, for a unit no interface's subnet holds (see `localInterfaceFor`) */
+    this.preferredInterface = preferredInterface;
     // an AD4D has two channels; asking it for four leaves reads that are never answered
     this.channels = channels ?? CHANNEL_COUNT;
     this.channelsGiven = channels != null;
@@ -208,7 +211,7 @@ export class Ad4qDevice extends EventEmitter {
   }
 
   async #join() {
-    const localIp = this.localIp ?? localInterfaceFor(this.host)?.address;
+    const localIp = this.localIp ?? localInterfaceFor(this.host, this.preferredInterface)?.address;
     if (!localIp) throw new Error('this computer has no network interface that can reach the unit');
     const session = new AcnSession({
       host: this.host,

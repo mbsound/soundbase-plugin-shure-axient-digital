@@ -710,3 +710,42 @@ test('the browse reports a unit lost while it runs, and starts afresh after it i
   assert.ok(await browser.find('127.0.0.1', 3000));
   assert.deepEqual(events, [['found', '127.0.0.1']], 'found afresh, never lost');
 });
+
+test('the browse can be held to chosen adapters, and moves when the choice changes', async (t) => {
+  const { localInterfaces, resolveInterface, localInterfaceFor } = await import('../driver/netutil.js');
+  const real = localInterfaces()[0];
+  if (real) {
+    assert.equal(resolveInterface(real.name).address, real.address, 'an adapter by name');
+    assert.equal(resolveInterface(real.name.toUpperCase())?.address, real.address, 'the name is not case-sensitive');
+    assert.equal(resolveInterface(real.address).name, real.name, 'an adapter by address');
+    // a unit no adapter's subnet holds is reached through the chosen adapter; a unit on a subnet through that one
+    assert.equal(localInterfaceFor('203.0.113.9', real), real);
+    assert.equal(localInterfaceFor('203.0.113.9', null)?.address, localInterfaces()[0].address);
+  }
+  assert.equal(resolveInterface('no-such-adapter0'), null);
+  assert.equal(resolveInterface('198.51.100.1'), null);
+  assert.equal(resolveInterface(''), null);
+  assert.equal(resolveInterface(undefined), null);
+
+  const slpPort = await freeUdpPort();
+  const fake = new FakeAd4q({ slpPort });
+  await fake.listen();
+  // no adapter at all: the browse joins and solicits nowhere, yet still hears what reaches the port
+  const browser = new SlpBrowser({ port: slpPort, interfaces: [], filter: isReceiverAdvert, solicitMs: 100 });
+  t.after(async () => {
+    browser.stop();
+    await fake.stop();
+  });
+  assert.ok(await browser.find('127.0.0.1', 3000), 'the fake advertises to the port on its own');
+  const before = browser.socket;
+  browser.setInterfaces([]);
+  assert.equal(browser.socket, before, 'the same choice changes nothing');
+  browser.setInterfaces(['127.0.0.1']);
+  await browser.start();
+  assert.notEqual(browser.socket, before, 'a new choice restarts the browse');
+  assert.deepEqual(browser.interfaces, ['127.0.0.1']);
+  assert.ok(await browser.find('127.0.0.1', 3000), 'and it is listening again');
+  browser.setInterfaces(null);
+  await browser.start();
+  assert.equal(browser.interfaces, null, 'back to every adapter');
+});

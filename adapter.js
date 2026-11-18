@@ -55,7 +55,7 @@ import { SCAN_LIMITS, defaultSpan, peakOf, planScan, scanDurationMs } from './dr
 import { SlpBrowser } from './driver/acn/slp.js';
 import { COMMAND_PORT, CommandClient, STATUS_PROPS, TX_PROPS, decodeShowLink, decodeTransmitter } from './driver/cmdstrings/client.js';
 import { FakeAd4q } from './driver/fake/fake-ad4q.js';
-import { isIpv4, parseAddressList } from './driver/netutil.js';
+import { isIpv4, parseAddressList, resolveInterface } from './driver/netutil.js';
 
 const manifest = JSON.parse(readFileSync(new URL('./soundbase-plugin.json', import.meta.url), 'utf8'));
 
@@ -296,14 +296,36 @@ let lastDiscoverAt = 0;
 
 const isAd4q = isReceiverAdvert;
 
+// The adapter the plugin is set to use ("Network adapter"): discovery's multicast goes out on it alone,
+// and a unit no adapter's subnet holds is reached through it. Blank means every adapter, as a plugin
+// with nothing configured must still find the units; an adapter named but not present is said once.
+let warnedInterface = null;
+export function selectedInterface(pluginConfig) {
+  const wanted = String(pluginConfig?.networkInterface ?? '').trim();
+  if (!wanted) return null;
+  const found = resolveInterface(wanted);
+  if (!found && warnedInterface !== wanted) {
+    warnedInterface = wanted;
+    log('warn', `the network adapter "${wanted}" is not present on this computer; discovery is not multicasting anywhere until it is, or the setting is changed`);
+  }
+  // named but absent: multicast nowhere rather than everywhere, which is what the setting is for
+  return found ?? { name: wanted, address: null, netmask: null };
+}
+/** The browse's interface list for a setting: null for every adapter, [] for one that is absent. */
+const browseInterfaces = (pluginConfig) => {
+  const selected = selectedInterface(pluginConfig);
+  return selected ? (selected.address ? [selected.address] : []) : null;
+};
+
 function ensureBrowser(pluginConfig) {
   const targets = parseAddressList(pluginConfig?.addresses);
   if (!browser) {
-    browser = new SlpBrowser({ targets, filter: isAd4q, log });
+    browser = new SlpBrowser({ targets, interfaces: browseInterfaces(pluginConfig), filter: isAd4q, log });
     browser.on('found', (u) => log('info', `found ${u.fctn} "${u.uacn}" at ${u.ip}:${u.port} (${u.cidText})`));
     browser.on('lost', (u) => log('info', `lost ${u.fctn} "${u.uacn}" at ${u.ip}`));
   } else {
     browser.setTargets(targets);
+    browser.setInterfaces(browseInterfaces(pluginConfig));
   }
   void browser.start();
   return browser;
@@ -625,7 +647,8 @@ class Ad4qMonitoringAdapter {
         requestTimeoutMs: 1000,
       };
     } else {
-      options = { ...options, cid: fromAdvert ? null : deviceCid(this.device), port: devicePort(this.device), browser: ensureBrowser(this.pluginConfig) };
+      const preferred = selectedInterface(this.pluginConfig);
+      options = { ...options, cid: fromAdvert ? null : deviceCid(this.device), port: devicePort(this.device), browser: ensureBrowser(this.pluginConfig), preferredInterface: preferred?.address ? preferred : null };
     }
     const unit = new Ad4qDevice(options);
     unit.on('prop', (change) => this.#onChange(change));
@@ -1451,7 +1474,8 @@ class Ad4qSpectrumAdapter {
         requestTimeoutMs: 1000,
       };
     } else {
-      options = { ...options, cid: deviceCid(this.device), port: devicePort(this.device), browser: ensureBrowser(this.pluginConfig) };
+      const preferred = selectedInterface(this.pluginConfig);
+      options = { ...options, cid: deviceCid(this.device), port: devicePort(this.device), browser: ensureBrowser(this.pluginConfig), preferredInterface: preferred?.address ? preferred : null };
     }
     const unit = new Ad4qDevice(options);
     unit.on('lost', (err) => this.#lost(unit, err));

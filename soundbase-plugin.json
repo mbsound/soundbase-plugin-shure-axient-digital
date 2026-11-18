@@ -11690,6 +11690,13 @@
       "label": "AD4Q units on this computer's network are found automatically. For units on another subnet, list their addresses below or add them by IP address."
     },
     {
+     "id": "networkInterface",
+     "type": "textinput",
+     "label": "Network adapter",
+     "default": "",
+     "help": "The adapter the Shure units are on, by name (en0) or by its IPv4 address. Discovery multicasts on this adapter only, and a unit on another subnet is reached through it. Blank: every adapter of this computer."
+    },
+    {
       "id": "addresses",
       "type": "textinput",
       "label": "Additional AD4Q addresses",

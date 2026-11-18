@@ -99,6 +99,12 @@ address, or list addresses under **Additional AD4Q addresses** in the plugin's
 settings. Tick **Simulate an AD4Q** to get a pretend four-channel unit with no
 hardware at all.
 
+Set **Network adapter** to the adapter the Shure units are on (its name, such
+as `en0`, or its IPv4 address). Discovery then multicasts on that adapter
+alone instead of on every adapter the computer has, which keeps the plugin's
+traffic off office, Wi-Fi and VPN networks that have no units on them. Left
+blank, every adapter is used.
+
 Opening a unit takes a few seconds: the AD4Q wants a paced handshake before it
 will talk. If something else already controls it, such as Wireless Workbench on
 another computer, check there first.

@@ -197,11 +197,15 @@ export class ControllerAdvert {
 /**
  * Listens for devices' adverts and remembers when each was last heard. Cheap
  * enough to leave running; `stop()` releases the socket.
+ *
+ * `interfaces` is the list of local IPv4 addresses the multicast goes out on
+ * and is listened for; null means every interface of the computer. A list
+ * keeps the solicits off networks that have no units on them.
  */
 export class SlpBrowser extends EventEmitter {
   /**
    * @param {{
-   *   targets?: string[], multicast?: boolean, port?: number,
+   *   targets?: string[], multicast?: boolean, port?: number, interfaces?: string[]|null,
    *   filter?: (unit: object) => boolean, listedMs?: number, solicitMs?: number,
    *   log?: (level: string, message: string) => void,
    * }} options
@@ -210,6 +214,7 @@ export class SlpBrowser extends EventEmitter {
     targets = [],
     multicast = true,
     port = SLP_PORT,
+    interfaces = null,
     filter = () => true,
     listedMs = 30_000,
     solicitMs = 5_000,
@@ -218,6 +223,7 @@ export class SlpBrowser extends EventEmitter {
     super();
     this.targets = targets;
     this.multicast = multicast;
+    this.interfaces = interfaces;
     this.port = port;
     this.filter = filter;
     this.listedMs = listedMs;
@@ -231,6 +237,23 @@ export class SlpBrowser extends EventEmitter {
 
   setTargets(targets) {
     this.targets = targets;
+  }
+
+  /** Change the adapters the browse uses; a running browse restarts on the new ones. */
+  setInterfaces(interfaces) {
+    const same = (a, b) => (a === null && b === null) || (!!a && !!b && a.length === b.length && a.every((x, i) => x === b[i]));
+    if (same(this.interfaces, interfaces)) return;
+    const running = !!(this.socket || this.starting);
+    this.interfaces = interfaces;
+    if (running) {
+      this.stop();
+      void this.start();
+    }
+  }
+
+  /** The local addresses the multicast goes out on and is listened for. */
+  #addresses() {
+    return this.interfaces ?? localAddresses();
   }
 
   start() {
@@ -265,7 +288,7 @@ export class SlpBrowser extends EventEmitter {
       return;
     }
     if (this.multicast) {
-      for (const address of localAddresses()) {
+      for (const address of this.#addresses()) {
         try {
           socket.addMembership(SLP_GROUP, address);
         } catch {
@@ -304,7 +327,7 @@ export class SlpBrowser extends EventEmitter {
       }
     }
     if (!this.multicast) return;
-    for (const address of localAddresses()) {
+    for (const address of this.#addresses()) {
       try {
         socket.setMulticastInterface(address);
         socket.send(request, SLP_PORT, SLP_GROUP);
