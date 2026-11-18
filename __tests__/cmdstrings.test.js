@@ -49,8 +49,11 @@ test('what the unit reports on its own arrives as events', async (t) => {
   const reps = [];
   client.on('rep', (r) => reps.push(r));
   fake.receiveTransmitter(2, { model: 'ADX2', deviceId: 'LeadVox', batteryPercent: 88 });
-  await delay(100);
-  const values = Object.fromEntries(reps.filter((r) => r.channel === 2).map((r) => [r.prop, r.args[0]]));
+  // the reports arrive over TCP in their own time (a slow CI runner takes longer than 100 ms)
+  const onChannel2 = () => reps.filter((r) => r.channel === 2);
+  const deadline = Date.now() + 3000;
+  while (!onChannel2().some((r) => r.prop === 'TX_MUTE_MODE_STATUS') && Date.now() < deadline) await delay(10);
+  const values = Object.fromEntries(onChannel2().map((r) => [r.prop, r.args[0]]));
   const tx = decodeTransmitter(values);
   assert.equal(tx.present, true);
   assert.equal(tx.model, 'ADX2');
