@@ -202,8 +202,12 @@ the same device settings. The differences this plugin handles:
   back); the command-strings port refuses it.
 - **The licence is read, not guessed.** The unit reports its licensed channel
   count, and discovery offers the product of that size; counting the channels
-  that answer is the fallback. The count is re-read whenever the unit
-  reappears on the network, so licences added or moved are picked up.
+  that answer is the fallback. A count more than ten minutes old is re-read in
+  the background the next time the unit is listed, so licences added or moved
+  are picked up without holding the listing up. A device already added keeps
+  the count it was added with (SoundBase fixes it from the product); when the
+  unit's licence no longer matches, the device shows a notice saying to remove
+  and re-add it.
 - **Four transmission modes.** ULX-D Standard, ULX-D High Density, Axient
   Digital Standard and Axient Digital High Density, read from the unit and
   shown on the unit's card, read-only: a change restarts the frame. The unit advertises `MCR_ULXD` in the
@@ -233,9 +237,11 @@ was open to them, and reconnecting only began the next cycle (2026-11-02). The
 plugin now reads the firmware first and sends no string-keyed request (the
 licence, the antenna pairs, the transmission mode) to a unit below 1.2.0: the
 channel count is taken one name at a time, and those three features are
-absent on such a unit. A unit that drops its session twice in ten minutes
-without having been asked to restart is left alone for fifteen minutes, with
-the reason in the plugin log, rather than reconnected into another restart.
+absent on such a unit, and the card does not show them. A unit that drops its
+session twice in ten minutes without having been asked to restart (or that
+stops answering, or does not come back after a restart) is left alone for
+fifteen minutes, with the reason in the plugin log, rather than reconnected
+into another restart.
 Whether that is enough for the older firmware has not been tried; 1.2.18.0 is
 the firmware this plugin was built against, and updating is the safe answer.
 

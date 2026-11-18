@@ -591,3 +591,122 @@ test('closing a session while its socket binds rejects the pending connection', 
   await assert.rejects(connecting, /closed while binding/);
   assert.equal(session.socket, null);
 });
+
+test('a component id the project remembers opens the session at once; a frame it does not match is found from its advert', async (t) => {
+  const slpPort = await freeUdpPort();
+  const fake = new FakeAd4q({ slpPort });
+  await fake.listen();
+  const browser = new SlpBrowser({ port: slpPort, multicast: false, filter: isReceiverAdvert });
+  t.after(async () => {
+    browser.stop();
+    await fake.stop();
+  });
+  const timings = { sendGapMs: 2, connectTimeoutMs: 1500 };
+  // the right id: no advert is waited for
+  const known = new Ad4qDevice({ host: '127.0.0.1', port: fake.controlPort, cid: fake.cid.toString('hex'), browser, localIp: '127.0.0.1', advert: false, timings });
+  t.after(() => known.close());
+  await known.connect();
+  assert.equal(known.connected, true);
+  // another frame's id at this address: the unit does not take the join, and the advert says who is really here
+  const stale = new Ad4qDevice({ host: '127.0.0.1', port: fake.controlPort, cid: 'ffffffff000011dda000000eddcccccc', browser, localIp: '127.0.0.1', advert: false, timings });
+  t.after(() => stale.close());
+  await browser.find('127.0.0.1', 3000);
+  await stale.connect();
+  assert.ok(fake.ignoredJoins >= 1, 'the unit ignored the join that named another frame');
+  assert.equal(stale.cid, fake.cid.toString('hex'), 'joined the frame that is there now');
+  assert.equal((await stale.readAll()).device.model, 'AD4Q-A');
+});
+
+test('an ANX4 added with one channel count reports the licence it now holds', async (t) => {
+  const { device } = await connected(t, { channels: 12, licensed: true }, { model: 'ANX4', channels: 16 });
+  assert.equal(device.channels, 12, 'the count it was added with stands: the host fixed it from the product');
+  assert.equal(device.licensedChannels, 16, 'the licence the unit reports');
+  const same = await connected(t, { channels: 16, licensed: true }, { model: 'ANX4', channels: 16 });
+  assert.equal(same.device.licensedChannels, 16);
+});
+
+test('an ANX4 is not subscribed to its sync presets, which the refresh reads', async (t) => {
+  const { fake, device } = await connected(t, { licensed: true }, { model: 'ANX4', channels: 4 });
+  const { SYNC_PRESETS, CHANNEL_PROPS, chanAddr: addrOf } = await import('../driver/ad4q/properties.js');
+  const subscribed = new Set();
+  for (const ctl of fake.controllers.values()) for (const a of ctl.subscribed) subscribed.add(a);
+  await device.subscribeAll();
+  await delay(300);
+  for (const ctl of fake.controllers.values()) for (const a of ctl.subscribed) subscribed.add(a);
+  const syncObjs = Object.values(SYNC_PRESETS).map((p) => p.obj);
+  for (let c = 1; c <= 4; c += 1) {
+    for (const obj of syncObjs) assert.ok(!subscribed.has(addrOf(c, obj)), `sync preset 0x${obj.toString(16)} on channel ${c} is not subscribed`);
+    for (const p of CHANNEL_PROPS.filter((p) => p.subscribe !== false)) assert.ok(subscribed.has(addrOf(c, p.obj)), `${p.key} on channel ${c} is subscribed`);
+  }
+  // a preset changed on the unit shows on the next read all the same
+  assert.equal((await device.readAll()).channels[2].syncRfPower, 'No change');
+  await device.setChannel(2, 'syncRfPower', 'Low');
+  assert.equal((await device.readAll()).channels[2].syncRfPower, 'Low');
+});
+
+test('an unlink is read back: an empty slot is null, a slot the unit kept is what it holds', async (t) => {
+  const { fake, device } = await connected(t);
+  const { rosterIdAddr } = await import('../driver/ad4q/properties.js');
+  fake.syncTransmitter(3, 2, { model: 'ADX2', serial: '0048ba2e' });
+  await delay(20);
+  assert.equal(await device.unlinkSlot(3, 2), null, 'cleared on the unit');
+  // a unit that ignores the write (the fake made to keep the slot): the read-back says so
+  const addr = rosterIdAddr(3, 4);
+  const id = Buffer.concat([Buffer.from([0xff, 0x12, 0x34, 0x56]), Buffer.alloc(12)]);
+  fake.setLocal(addr, id);
+  const entry = fake.store.get(addr);
+  const check = entry.check;
+  entry.check = () => false;
+  await assert.rejects(device.unlinkSlot(3, 4), WriteRefused);
+  entry.check = check;
+  // accepted but not applied: the slot keeps its identity, and the read-back says so
+  const originalSet = device.set.bind(device);
+  device.set = async (a, v) => { await originalSet(a, v); fake.store.get(a).value = id; };
+  assert.deepEqual(await device.unlinkSlot(3, 4), { slot: 4, serial: '123456' });
+});
+
+test('reads stop as soon as the unit is declared lost, instead of running every address out', async (t) => {
+  const { fake, device } = await connected(t, { requestTimeoutMs: 250, licensed: true }, { model: 'ANX4', channels: 24 });
+  const addresses = [...fake.store.keys()];
+  assert.ok(addresses.length > 600, `${addresses.length} addresses on a 24-channel frame`);
+  const lost = new Promise((resolve) => device.once('lost', resolve));
+  // the unit wedges: it still acknowledges, so every send goes through, but nothing is answered
+  fake.silent = true;
+  const t0 = Date.now();
+  const got = await device.getMany(addresses);
+  const took = Date.now() - t0;
+  assert.equal(got.size, 0);
+  assert.ok(device.lost, 'the unit was declared lost');
+  assert.equal(device.connected, false, 'and is no longer connected');
+  assert.ok(took < 4000, `the read gave up in ${took} ms rather than one timeout per address`);
+  await lost;
+});
+
+test('the browse reports a unit lost while it runs, and starts afresh after it is stopped', async (t) => {
+  const slpPort = await freeUdpPort();
+  const fake = new FakeAd4q({ slpPort });
+  await fake.listen();
+  const browser = new SlpBrowser({ port: slpPort, multicast: false, filter: isReceiverAdvert, listedMs: 300, solicitMs: 100 });
+  t.after(async () => {
+    browser.stop();
+    await fake.stop();
+  });
+  const events = [];
+  browser.on('found', (u) => events.push(['found', u.ip]));
+  browser.on('lost', (u) => events.push(['lost', u.ip]));
+  assert.ok(await browser.find('127.0.0.1', 3000));
+  // the adverts stop; nothing asks for the list, and the unit is still reported lost
+  await fake.stop();
+  await delay(900);
+  assert.deepEqual(events, [['found', '127.0.0.1'], ['lost', '127.0.0.1']]);
+  // what a stopped browse heard is not carried into the next run as something to lose
+  const again = new FakeAd4q({ slpPort });
+  await again.listen();
+  t.after(() => again.stop());
+  assert.ok(await browser.find('127.0.0.1', 3000));
+  browser.stop();
+  assert.equal(browser.units.size, 0, 'a stopped browse keeps no picture');
+  events.length = 0;
+  assert.ok(await browser.find('127.0.0.1', 3000));
+  assert.deepEqual(events, [['found', '127.0.0.1']], 'found afresh, never lost');
+});

@@ -23,6 +23,7 @@ import {
   PRODUCT_AD4D,
   PRODUCT_ANX4,
   SIM_DEVICE_ID,
+  asciiName,
   createMonitoringAdapter,
   discoverDevices,
   layoutFor,
@@ -165,8 +166,13 @@ test('a unit that drops its session twice in ten minutes is stood down for fifte
   assert.equal(standDownUntil('net:10.0.0.9', until + 1), null, 'over when it is over');
   assert.equal(recordLoss('net:10.0.0.9', until + 60_000), null, 'the window starts afresh');
   assert.equal(recordLoss('net:10.0.0.9', until + 11 * 60_000 + 1), null, 'a loss outside the window does not count with the earlier one');
+  // the unit's two sessions (monitoring and scan) drop in the same moment: that is one loss, not two
+  assert.equal(recordLoss('net:10.0.0.8', t0), null);
+  assert.equal(recordLoss('net:10.0.0.8', t0 + 2000), null, 'the scan adapter reporting the same drop does not count again');
+  assert.notEqual(recordLoss('net:10.0.0.8', t0 + 60_000), null, 'a drop a minute later does');
   const adapter = createMonitoringAdapter({ id: 'net:10.0.0.9', product: PRODUCT_ANX4(12), config: { host: '10.0.0.9' } }, {});
-  recordLoss('net:10.0.0.9'); recordLoss('net:10.0.0.9');
+  const now = Date.now();
+  recordLoss('net:10.0.0.9', now - 60_000); recordLoss('net:10.0.0.9', now);
   await assert.rejects(adapter.open(), /standing down/, 'no session is opened while standing down');
   resetLosses();
 });
@@ -178,6 +184,47 @@ test('a setting the model does not offer is refused before it reaches the unit',
   assert.equal(anx4.channels, 16);
   assert.equal(anx4.anx4, true);
   assert.equal(ad4q.anx4, false);
+});
+
+test('the descriptors follow the product the device was added as, not the model string the unit gives', () => {
+  const ids = (list) => list.map((p) => p.id);
+  // an AD4Q product at an address where an ANX4 now sits: no ANX4 settings are offered, since none would be written
+  const asAd4q = ids(propertyDescriptors({ model: 'ANX4', anx4: false }));
+  assert.ok(!asAd4q.includes('antenna') && !asAd4q.includes('syncRfPower') && !asAd4q.includes('transmissionMode'));
+  assert.ok(asAd4q.includes('transmitterPower') && asAd4q.includes('highDensityMode') && asAd4q.includes('antennaBias'));
+  const asAnx4 = ids(propertyDescriptors({ model: 'AD4Q-A', anx4: true }));
+  assert.ok(asAnx4.includes('antenna') && asAnx4.includes('syncRfPower') && asAnx4.includes('transmissionMode'));
+  assert.ok(!asAnx4.includes('transmitterPower') && !asAnx4.includes('highDensityMode') && !asAnx4.includes('quadversity'));
+  // without the product, the model decides, as before
+  assert.ok(ids(propertyDescriptors({ model: 'ANX4' })).includes('antenna'));
+});
+
+test('an ANX4 whose firmware is not sent string-keyed requests shows neither the antenna nor the transmission mode', () => {
+  const full = layoutFor(PRODUCT_ANX4(8));
+  const flat = (nodes) => nodes.flatMap((n) => (n.type === 'group' ? flat(n.children) : [n]));
+  assert.ok(flat(full.channel).some((n) => n.type === 'control' && n.propertyId === 'antenna'));
+  assert.ok(flat(full.device).some((n) => n.type === 'value' && /transmissionMode$/.test(n.bind)));
+  const limited = layoutFor(PRODUCT_ANX4(8), { stringKeys: false });
+  const channel = flat(limited.channel);
+  const device = flat(limited.device);
+  assert.ok(!channel.some((n) => n.propertyId === 'antenna'), 'no antenna control');
+  assert.ok(!channel.some((n) => n.type === 'value' && n.bind === KEYS.antenna), 'no antenna cell');
+  assert.ok(!device.some((n) => /transmissionMode$/.test(n.bind ?? '')), 'no transmission mode cell');
+  assert.ok(channel.some((n) => n.propertyId === 'syncRfPower'), 'the sync presets stay: they are plain objects');
+  // both prunings at once
+  const both = flat(layoutFor(PRODUCT_ANX4(8), { stringKeys: false, quickToggles: false }).channel);
+  assert.ok(!both.some((n) => n.propertyId === 'toneGenerator') && !both.some((n) => n.propertyId === 'antenna'));
+  // what the descriptors omit, the layout omits too
+  const offered = new Set(propertyDescriptors({ model: 'ANX4', anx4: true, stringKeys: false }).map((p) => p.id));
+  for (const n of [...channel, ...device]) if (n.type === 'control') assert.ok(offered.has(n.propertyId), `${n.propertyId} is offered`);
+});
+
+test('a name the unit cannot hold is reduced to what it can, not refused', () => {
+  assert.equal(asciiName('R\u00e9sum\u00e9\u2014\u201cx\u201d', 8), 'Resume-"');
+  assert.equal(asciiName('Vox \u2018A\u2019', 31), "Vox 'A'");
+  assert.equal(asciiName('\u00dcber \u2026', 31), 'Uber ...');
+  assert.equal(asciiName('\u65e5\u672c Ch', 31), ' Ch', 'what has no plain form is dropped');
+  assert.equal(asciiName('plain', 31), 'plain');
 });
 
 test('the adapter sizes itself to the product it is given', () => {
@@ -372,6 +419,14 @@ test('requests the plugin can tell are impossible are answered 400', async () =>
   await bad('toneVolume', 3, 1, 'unknown_property');
 });
 
+test('a per-channel ANX4 setting without its channel is a bad request, not a device fault', async () => {
+  for (const [propertyId, value, channelIndex] of [['syncRfPower', 'High', undefined], ['antenna', 'CD', undefined], ['syncLocks', 'Menu', 9], ['antenna', 'AB', 9]]) {
+    const res = await request('POST', `${DEVICE_PATH}/commands`, { requestId: `t-chan-${propertyId}-${channelIndex}`, propertyId, value, ...(channelIndex !== undefined ? { channelIndex } : {}) });
+    assert.equal(res.status, 400, `${propertyId} without a valid channel: ${JSON.stringify(res.body)}`);
+    assert.equal(res.body.error ?? res.body.code, 'unknown_channel', JSON.stringify(res.body));
+  }
+});
+
 test('the talk switch routes each output on its own, leaving the others as they were', async (t) => {
   const stream = await openEvents();
   t.after(() => stream.close());
@@ -469,6 +524,32 @@ test('HD mode is writable; the restart it causes is ridden out and the device st
     await waitFor(() => stateFor(stream.records, 'connection').filter((p) => p.value.connected === false).length > dropsBefore, 4000, 'the second drop');
     await waitFor(() => latest(stream, KEYS.unit)?.hdMode === false && stateFor(stream.records, 'connection').at(-1)?.value.connected === true, 10_000, 'standard mode again');
     assert.equal(fake.restarts, restartsBefore + 2);
+  } finally {
+    stream.close();
+  }
+});
+
+test('a unit that drops again while its session is being rebuilt is ridden out, not reported failed', async () => {
+  const stream = await openEvents();
+  try {
+    await waitFor(async () => (await deviceRow())?.status.status === 'ok', 5000, 'the opened device');
+    const fake = getSimulator();
+    const restartsBefore = fake.restarts;
+    // the next controller to join after the restart (the rebuilt session) sees the unit go down once more
+    fake.restartAgainOnJoin = 1;
+    assert.equal((await command('highDensityMode', true)).status, 202);
+    await waitFor(() => fake.restarts === restartsBefore + 2, 15_000, 'the second restart');
+    assert.notEqual((await deviceRow()).status.status, 'failed', 'a drop mid-rebuild is still the restart');
+    await waitFor(() => stateFor(stream.records, 'connection').at(-1)?.value.connected === true && latest(stream, KEYS.unit)?.hdMode === true, 20_000, 'the unit back after the second drop');
+    await waitFor(async () => (await deviceRow()).status.status === 'ok' && !(await deviceRow()).status.warnings?.some((w) => w.id === 'restarting'), 5000, 'the restart warning to clear');
+    assert.equal(fake.restartAgainOnJoin, 0);
+    // settled: writes work again, and HD mode back to standard restarts it once
+    const dropsBefore = stateFor(stream.records, 'connection').filter((p) => p.value.connected === false).length;
+    assert.equal((await command('highDensityMode', false)).status, 202);
+    await waitFor(() => stateFor(stream.records, 'connection').filter((p) => p.value.connected === false).length > dropsBefore, 5000, 'the drop');
+    await waitFor(() => latest(stream, KEYS.unit)?.hdMode === false && stateFor(stream.records, 'connection').at(-1)?.value.connected === true, 20_000, 'standard mode again');
+    assert.equal(fake.restarts, restartsBefore + 3);
+    assert.equal((await deviceRow()).status.status, 'ok');
   } finally {
     stream.close();
   }

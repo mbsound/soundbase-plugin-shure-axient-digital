@@ -274,8 +274,22 @@ export class SlpBrowser extends EventEmitter {
       }
     }
     this.#solicit();
-    this.timer = setInterval(() => this.#solicit(), this.solicitMs);
+    this.timer = setInterval(() => {
+      this.#age();
+      this.#solicit();
+    }, this.solicitMs);
     this.timer.unref?.();
+  }
+
+  /** Forget the units not heard from lately, and say so; runs on the solicit tick as well as on each listing. */
+  #age() {
+    const now = Date.now();
+    for (const [ip, unit] of this.units) {
+      if (now - unit.lastSeen > this.listedMs) {
+        this.units.delete(ip);
+        this.emit('lost', unit);
+      }
+    }
   }
 
   #solicit() {
@@ -312,13 +326,7 @@ export class SlpBrowser extends EventEmitter {
 
   /** Units heard from recently. */
   devices() {
-    const now = Date.now();
-    for (const [ip, unit] of this.units) {
-      if (now - unit.lastSeen > this.listedMs) {
-        this.units.delete(ip);
-        this.emit('lost', unit);
-      }
-    }
+    this.#age();
     return [...this.units.values()];
   }
 
@@ -344,5 +352,8 @@ export class SlpBrowser extends EventEmitter {
     } catch {
       // already closed
     }
+    // a stopped browse has no current picture: what it heard before is not reported lost when it next
+    // runs, and every unit is found afresh
+    this.units.clear();
   }
 }

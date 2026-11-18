@@ -185,10 +185,14 @@ const COMMAND_RETRY_MAX_MS = 60_000;
 // this plugin's session, and every reconnect only started the next cycle (2026-11-02).
 const LOSS_WINDOW_MS = 10 * 60_000;
 const STAND_DOWN_MS = 15 * 60_000;
-const losses = new Map(); // device id -> { at: [ms...], until: ms }
+/** losses this close together are one event: the unit's two sessions (monitoring and scan) drop at the same moment */
+const LOSS_DEBOUNCE_MS = 5000;
+const losses = new Map(); // device id -> { at: [ms...], until: ms, lastAt: ms }
 /** Record a session loss that was not an expected restart; returns the stand-down end when one begins. */
 export function recordLoss(id, now = Date.now()) {
-  const entry = losses.get(id) ?? { at: [], until: 0 };
+  const entry = losses.get(id) ?? { at: [], until: 0, lastAt: 0 };
+  if (entry.lastAt && now - entry.lastAt < LOSS_DEBOUNCE_MS) return entry.until > now ? entry.until : null;
+  entry.lastAt = now;
   entry.at = entry.at.filter((t) => now - t < LOSS_WINDOW_MS);
   entry.at.push(now);
   if (entry.at.length >= 2) { entry.until = now + STAND_DOWN_MS; entry.at = []; }
@@ -202,6 +206,8 @@ export function standDownUntil(id, now = Date.now()) {
 }
 export const resetLosses = () => losses.clear();
 const SAMPLE_MS = 1000;
+/** how long close() waits in all for the unit to confirm the meter rates set back to 0 */
+const METER_RESET_MS = 3000;
 const RECONNECT_GAP_MS = 2000;
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -237,14 +243,24 @@ const showLinkLockOffered = () => env('SB_AD4Q_SHOWLINK_LOCK') === '1';
 const QUICK_TOGGLE_PROPERTIES = Object.freeze(['toneGenerator']);
 const QUICK_TONE_DB = -30;
 
-/** The manifest's layout for a product, without the controls of properties the unit does not offer. */
-export function layoutFor(product, { quickToggles = true } = {}) {
+/** The ANX4 settings that reach the unit as string-keyed requests, and the cells that show them. */
+const STRING_KEY_CONTROLS = Object.freeze(['antenna', 'transmissionMode']);
+const STRING_KEY_BINDS = Object.freeze([KEYS.antenna, `${KEYS.unit}.transmissionMode`]);
+
+/**
+ * The manifest's layout for a product, without the controls of properties the unit does not offer:
+ * the quick toggles when the plugin setting turns them off, and the antenna pair and transmission
+ * mode on an ANX4 whose firmware is not sent string-keyed requests (`stringKeys`).
+ */
+export function layoutFor(product, { quickToggles = true, stringKeys = true } = {}) {
   const layout = manifest.products.find((p) => p.deviceTypeId === product)?.layout;
-  if (!layout || quickToggles) return layout;
+  if (!layout || (quickToggles && stringKeys)) return layout;
+  const dropped = (n) =>
+    (n.type === 'control' && !quickToggles && QUICK_TOGGLE_PROPERTIES.includes(n.propertyId)) ||
+    (n.type === 'control' && !stringKeys && STRING_KEY_CONTROLS.includes(n.propertyId)) ||
+    (n.type === 'value' && !stringKeys && STRING_KEY_BINDS.includes(n.bind));
   const prune = (nodes) =>
-    nodes
-      ?.filter((n) => !(n.type === 'control' && QUICK_TOGGLE_PROPERTIES.includes(n.propertyId)))
-      .map((n) => (n.type === 'group' ? { ...n, children: prune(n.children) } : n));
+    nodes?.filter((n) => !dropped(n)).map((n) => (n.type === 'group' ? { ...n, children: prune(n.children) } : n));
   return { ...layout, channel: prune(layout.channel), device: prune(layout.device) };
 }
 
@@ -285,11 +301,7 @@ function ensureBrowser(pluginConfig) {
   if (!browser) {
     browser = new SlpBrowser({ targets, filter: isAd4q, log });
     browser.on('found', (u) => log('info', `found ${u.fctn} "${u.uacn}" at ${u.ip}:${u.port} (${u.cidText})`));
-    browser.on('lost', (u) => {
-      log('info', `lost ${u.fctn} "${u.uacn}" at ${u.ip}`);
-      const known = anx4Probes.get(u.ip);
-      if (known) known.lostAt = Date.now();
-    });
+    browser.on('lost', (u) => log('info', `lost ${u.fctn} "${u.uacn}" at ${u.ip}`));
   } else {
     browser.setTargets(targets);
   }
@@ -307,24 +319,26 @@ const discoveredDevice = (unit, probe = null) => ({
   name: `${probe ? `ANX4 ${probe.name ?? ''}`.trim() : unit.uacn || unit.fctn} (${unit.ip})`,
   product: productFor(unit.fctn, probe?.channels ?? null),
   transport: { kind: 'network', host: unit.ip, port: unit.port },
-  config: { host: unit.ip },
+  // the component id and port from the advert: the unit is opened on them without waiting for another advert
+  config: { host: unit.ip, cid: unit.cidText, port: unit.port },
 });
 
 // An ANX4's product is its licensed channel count, which only the unit knows: a short session
-// counts the channels (and reads the unit's name) once per unit and the answer is kept while the
-// unit stays on the network; until it is in, the unit is not listed. A probe that fails is not
-// repeated for a while, and a unit the browse loses is counted afresh when it is back (its
-// licences may have changed, or it may be another frame at the same address).
+// counts the channels (and reads the unit's name) once per frame and the answer is kept while that
+// frame (by component id) is the one advertising at the address; until it is in, the unit is not
+// listed. A probe that fails is not repeated for a while. A count older than ANX4_RECOUNT_MS is
+// verified again in the background the next time the unit is listed (its licences may have
+// changed), without holding the listing up.
 const ANX4_PROBE_RETRY_MS = 60_000;
-/** a unit that disappears and returns is counted again only when its count is this old (a restarting unit is not re-probed on every return) */
 const ANX4_RECOUNT_MS = 10 * 60_000;
-const anx4Probes = new Map(); // ip -> { cid, channels, name } | { cid, promise } | { cid, failedAt }
+const anx4Probes = new Map(); // ip -> { cid, channels, name, at, recount? } | { cid, promise } | { cid, failedAt }
 export const resetAnx4Probes = () => anx4Probes.clear();
 export async function probeAnx4(unit) {
-  const probe = new Ad4qDevice({ host: unit.ip, cid: unit.cid, port: unit.port, channels: MAX_CHANNELS, licensed: true, log });
+  // no channel count is given, so the connect counts the channels itself (the licence where the firmware reports it)
+  const probe = new Ad4qDevice({ host: unit.ip, cid: unit.cid, port: unit.port, licensed: true, log });
   try {
     await probe.connect();
-    const channels = await probe.countChannels();
+    const channels = probe.channels;
     const name = decodeString(await probe.get(DEV.NAME).catch(() => null)) || null;
     return { channels, name };
   } finally {
@@ -333,18 +347,28 @@ export async function probeAnx4(unit) {
 }
 function anx4ProbeFor(unit) {
   const known = anx4Probes.get(unit.ip);
-  if (known && known.cid === unit.cid) {
-    if (typeof known.channels === 'number' && !(known.lostAt && Date.now() - known.at > ANX4_RECOUNT_MS)) return known;
-    if (known.promise) return null;
-    if (known.failedAt && Date.now() - known.failedAt < ANX4_PROBE_RETRY_MS) return null;
-  }
-  if (standDownUntil(`${NET_ID_PREFIX}${unit.ip}`)) return known && typeof known.channels === 'number' ? known : null;
+  // what is known of another frame at this address (by component id) says nothing about this one
+  const same = known && known.cid === unit.cid ? known : null;
+  if (same?.promise) return null;
+  if (same?.failedAt && Date.now() - same.failedAt < ANX4_PROBE_RETRY_MS) return null;
+  const counted = same && typeof same.channels === 'number' ? same : null;
+  const standingDown = standDownUntil(`${NET_ID_PREFIX}${unit.ip}`);
+  if (counted && (standingDown || counted.recount || Date.now() - counted.at < ANX4_RECOUNT_MS)) return counted;
+  if (standingDown) return null; // no session to a unit that is being left alone
   const promise = probeAnx4(unit).then(
-    ({ channels, name }) => { anx4Probes.set(unit.ip, { cid: unit.cid, channels, name, at: Date.now() }); log('info', `${unit.ip}: ANX4 licensed for ${channels} channel${channels === 1 ? '' : 's'}`); },
-    (err) => { anx4Probes.set(unit.ip, { cid: unit.cid, failedAt: Date.now() }); log('warn', `${unit.ip}: could not count the ANX4's channels (${err.message}); retrying in ${ANX4_PROBE_RETRY_MS / 1000} s`); }
+    ({ channels, name }) => {
+      anx4Probes.set(unit.ip, { cid: unit.cid, channels, name, at: Date.now() });
+      if (counted?.channels !== channels) log('info', `${unit.ip}: ANX4 licensed for ${channels} channel${channels === 1 ? '' : 's'}`);
+    },
+    (err) => {
+      // a recount that fails keeps the count it had until the next is due; a first count is tried again sooner
+      if (counted) anx4Probes.set(unit.ip, { ...counted, at: Date.now(), recount: null });
+      else anx4Probes.set(unit.ip, { cid: unit.cid, failedAt: Date.now() });
+      log('warn', `${unit.ip}: could not count the ANX4's channels (${err.message}); retrying in ${(counted ? ANX4_RECOUNT_MS : ANX4_PROBE_RETRY_MS) / 1000} s`);
+    }
   );
-  anx4Probes.set(unit.ip, { cid: unit.cid, promise });
-  return null;
+  anx4Probes.set(unit.ip, counted ? { ...counted, recount: promise } : { cid: unit.cid, promise });
+  return counted;
 }
 
 
@@ -412,8 +436,12 @@ const isAd4d = (model) => /^AD4D/i.test(String(model ?? ''));
 const isAnx4 = (model) => /^ANX4/i.test(String(model ?? ''));
 const fanModeOf = (alwaysOn) => (alwaysOn == null ? undefined : alwaysOn ? FAN_MODES[1] : FAN_MODES[0]);
 
-/** The properties a unit offers: a few depend on which unit it is. */
-export const propertyDescriptors = ({ model, quickToggles = true, stringKeys = true } = {}) => {
+/**
+ * The properties a unit offers: a few depend on which unit it is. `anx4` is the product the device
+ * was added as (what the adapter writes to and publishes for), not the model string the unit gives,
+ * so the two never disagree; it defaults to the model for callers that have only that.
+ */
+export const propertyDescriptors = ({ model, anx4 = isAnx4(model), quickToggles = true, stringKeys = true } = {}) => {
   const bands = BANDS_BY_RANGE[rangeOf(model)];
   const channel = (id, value, key, extra = {}) => ({
     id,
@@ -455,11 +483,11 @@ export const propertyDescriptors = ({ model, quickToggles = true, stringKeys = t
     channel('unregisteredTransmitter', { type: 'enum', options: [...UNREGISTERED_ACTIONS] }, KEYS.unregisteredTx),
     // the IR preset's RF power: what a transmitter takes on at its next IR sync
     // the AD4Q/AD4D IR-preset RF power; the ANX4 keeps it among its sync presets instead
-    ...(isAnx4(model) ? [] : [channel('transmitterPower', { type: 'enum', options: [...RF_POWER_MODES] }, KEYS.rfPower)]),
+    ...(anx4 ? [] : [channel('transmitterPower', { type: 'enum', options: [...RF_POWER_MODES] }, KEYS.rfPower)]),
     // ANX4: which antenna pair the channel listens on
-    ...(isAnx4(model) && stringKeys ? [channel('antenna', { type: 'enum', options: [...ANTENNA_SELECTIONS] }, KEYS.antenna)] : []),
+    ...(anx4 && stringKeys ? [channel('antenna', { type: 'enum', options: [...ANTENNA_SELECTIONS] }, KEYS.antenna)] : []),
     // ANX4 sync presets: what the next IR sync sends to the transmitter
-    ...(isAnx4(model) ? SYNC_IDS.map((id) => ({ id, scope: 'channel', access: 'readWrite', stateBinding: { key: KEYS.sync, path: [id] }, value: { type: 'enum', options: syncOptions(id) } })) : []),
+    ...(anx4 ? SYNC_IDS.map((id) => ({ id, scope: 'channel', access: 'readWrite', stateBinding: { key: KEYS.sync, path: [id] }, value: { type: 'enum', options: syncOptions(id) } })) : []),
     // each routing of the talk switch is its own switch; true means that output is on
     ...TALK_OUTPUTS.map((o) => ({
       id: talkPropertyId(o.id),
@@ -480,11 +508,11 @@ export const propertyDescriptors = ({ model, quickToggles = true, stringKeys = t
     bands ? unitProp('band', { type: 'enum', options: [...bands] }) : unitProp('band', { type: 'string' }, 'readOnly'),
     // writable by decision: the unit restarts itself after the change, which the adapter rides out
     // the AD4Q/AD4D's HD flag; an ANX4 has four transmission modes instead, shown read-only (a change restarts it)
-    ...(isAnx4(model) ? (stringKeys ? [unitProp('transmissionMode', { type: 'enum', options: [...TRANSMISSION_MODES] }, 'readOnly')] : []) : [{ ...unitProp('highDensityMode', { type: 'boolean' }), effects: ['deviceRestart'] }]),
+    ...(anx4 ? (stringKeys ? [unitProp('transmissionMode', { type: 'enum', options: [...TRANSMISSION_MODES] }, 'readOnly')] : []) : [{ ...unitProp('highDensityMode', { type: 'boolean' }), effects: ['deviceRestart'] }]),
     // the AD4D has no Quadversity; on an AD4Q it is shown, and only the front panel can change it.
     // The ANX4 has neither Quadversity nor the antenna-bias flag at the AD4Q's address
-    ...(isAd4d(model) || isAnx4(model) ? [] : [unitProp('quadversity', { type: 'string' }, 'readOnly')]),
-    ...(isAnx4(model) ? [] : [unitProp('antennaBias', { type: 'boolean' })]),
+    ...(isAd4d(model) || anx4 ? [] : [unitProp('quadversity', { type: 'string' }, 'readOnly')]),
+    ...(anx4 ? [] : [unitProp('antennaBias', { type: 'boolean' })]),
     // the plugin's own: while on, no frequency change (SoundBase's or a typed one) reaches a channel
     // whose transmitter has no ShowLink, so a change cannot leave a transmitter on the old frequency
     ...(showLinkLockOffered() ? [unitProp('requireShowlinkForFrequency', { type: 'boolean' })] : []),
@@ -497,6 +525,22 @@ export const propertyDescriptors = ({ model, quickToggles = true, stringKeys = t
 };
 
 const badValue = (propertyId, expected) => new HttpError(400, 'bad_value', `${propertyId} expects ${expected}`);
+
+/**
+ * A name as the unit can hold it: printable ASCII, at most `max` characters. Accented letters lose
+ * their accents, typographic quotes and dashes become the plain ones, and what is left over is
+ * dropped: clamped and echoed back, not refused.
+ */
+export const asciiName = (text, max) =>
+  String(text)
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[\u2018\u2019\u201a\u201b\u2032]/g, "'")
+    .replace(/[\u201c\u201d\u201e\u201f\u2033]/g, '"')
+    .replace(/[\u2010-\u2015\u2212]/g, '-')
+    .replace(/\u2026/g, '...')
+    .replace(/[^\x20-\x7e]/g, '')
+    .slice(0, max);
 
 const oneOf = (value, options) =>
   typeof value === 'string' ? options.find((o) => o.toLowerCase() === value.trim().toLowerCase()) : undefined;
@@ -550,6 +594,8 @@ class Ad4qMonitoringAdapter {
     // false until the first full read lands: a reply mid-read is not a change
     this.live = false;
     this.closed = false;
+    // set once a fault has been reported: the shell hears it once
+    this.failed = false;
     // assigned by the shell before open()
     this.onState = null;
     this.onWarnings = null;
@@ -560,8 +606,12 @@ class Ad4qMonitoringAdapter {
     log(level, `[${this.device.id}] ${message}`);
   }
 
-  /** A session to the unit, wired to this adapter; the caller connects it. */
-  async #newUnit() {
+  /**
+   * A session to the unit, wired to this adapter; the caller connects it. The component id the project
+   * holds opens it at once; `fromAdvert` waits for the unit's own advert instead, which after a restart
+   * is also the word that it is back (a join sent while it boots waits a connect timeout for nothing).
+   */
+  async #newUnit({ fromAdvert = false } = {}) {
     let options = { host: this.host, channels: this.channels, licensed: this.anx4, log: (l, m) => this.log(l, m) };
     if (this.simulated) {
       const fake = await ensureSimulator();
@@ -575,8 +625,7 @@ class Ad4qMonitoringAdapter {
         requestTimeoutMs: 1000,
       };
     } else {
-      const known = deviceCid(this.device);
-      options = { ...options, cid: known, browser: ensureBrowser(this.pluginConfig) };
+      options = { ...options, cid: fromAdvert ? null : deviceCid(this.device), port: devicePort(this.device), browser: ensureBrowser(this.pluginConfig) };
     }
     const unit = new Ad4qDevice(options);
     unit.on('prop', (change) => this.#onChange(change));
@@ -608,6 +657,7 @@ class Ad4qMonitoringAdapter {
     }
     this.onState?.('connection', { connected: true, since: new Date().toISOString() });
     await this.#refresh({ initial: true });
+    this.#reportIdentity(unit);
     this.live = true;
     // ask the unit to push changes, so the picture stays current between refreshes
     await unit.subscribeAll();
@@ -617,10 +667,11 @@ class Ad4qMonitoringAdapter {
     const refreshEvery = Math.max(this.refreshMs * Math.max(1, Math.ceil(this.channels / 4)), this.anx4 ? 60_000 : 0);
     this.refreshTimer = setInterval(() => this.#refresh().catch(() => {}), refreshEvery);
     this.refreshTimer.unref?.();
+    const stringKeys = !this.anx4 || unit.stringKeys;
     return {
       channelCount: this.channels,
-      properties: propertyDescriptors({ model: this.state.device.model, quickToggles: this.quickToggles, stringKeys: !this.anx4 || unit.stringKeys }),
-      layout: layoutFor(this.device?.product, { quickToggles: this.quickToggles }),
+      properties: propertyDescriptors({ model: this.state.device.model, anx4: this.anx4, quickToggles: this.quickToggles, stringKeys }),
+      layout: layoutFor(this.device?.product, { quickToggles: this.quickToggles, stringKeys }),
       identity: {
         model: this.state.device.model ?? 'AD4Q',
         serial: this.state.device.serial ?? undefined,
@@ -641,9 +692,33 @@ class Ad4qMonitoringAdapter {
   }
 
   #fatal(err) {
-    if (this.closed) return;
+    if (this.closed || this.failed) return;
+    this.failed = true;
     this.log('error', err.message);
     this.onFatal?.(err);
+  }
+
+  /** A loss that was not an expected restart: counted towards the stand-down, then reported as a fault. */
+  #unexpectedLoss(err) {
+    if (this.closed || this.failed) return;
+    const until = recordLoss(this.device?.id);
+    if (until) this.log('warn', `${this.host}: the unit dropped the session twice in ${LOSS_WINDOW_MS / 60_000} minutes; standing down until ${new Date(until).toISOString()} so it is not driven into another restart`);
+    this.#fatal(err);
+  }
+
+  /**
+   * The unit against the product it was added as: another kind of unit at the address, or an ANX4
+   * whose licence has changed, is said so on the device rather than half-driven.
+   */
+  #reportIdentity(unit) {
+    const model = this.state.device.model;
+    const kind = this.anx4 ? 'an ANX4' : 'an AD4Q or AD4D';
+    this.#setCondition('model-mismatch', model && isAnx4(model) !== this.anx4
+      ? { severity: 'warning', message: `This device was added as ${kind}, but the unit at ${this.host} reports itself as ${model}. Remove it and add it again so it is listed as what it is.` }
+      : null);
+    this.#setCondition('licence-changed', unit.licensedChannels != null && unit.licensedChannels !== this.channels
+      ? { severity: 'warning', message: `The ANX4 at ${this.host} is licensed for ${unit.licensedChannels} channel${unit.licensedChannels === 1 ? '' : 's'} but was added with ${this.channels}. Remove it and add it again to pick up the new licence.` }
+      : null);
   }
 
   /** One condition shown on the device, replaced by id; `null` clears it. The host hears only changes. */
@@ -684,8 +759,10 @@ class Ad4qMonitoringAdapter {
       this.log('info', `the command connection dropped (${err.message})`);
       this.#retryCommands();
     });
-    try {
-      for (let c = 1; c <= this.channels; c += 1) {
+    const unread = [];
+    for (let c = 1; c <= this.channels; c += 1) {
+      if (this.closed || this.commands !== client) return;
+      try {
         const values = {};
         for (const prop of [...TX_PROPS, ...STATUS_PROPS]) values[prop] = (await client.getChannel(c, prop))[0];
         this.commandValues[c] = values;
@@ -694,10 +771,14 @@ class Ad4qMonitoringAdapter {
           SLOT_SHOWLINK_STATUS: await client.getSlots(c, 'SLOT_SHOWLINK_STATUS'),
           SLOT_TX_MODEL: await client.getSlots(c, 'SLOT_TX_MODEL'),
         };
+      } catch (err) {
+        // one channel's silence (a slot report short of its eight lines, say) does not cost the rest their read;
+        // what was missed fills in as the unit reports it
+        unread.push(`${c} (${err.message})`);
+        if (!client.connected) break;
       }
-    } catch (err) {
-      this.log('warn', `the command read did not complete (${err.message})`);
     }
+    if (unread.length) this.log('warn', `the command read did not complete for channel${unread.length > 1 ? 's' : ''} ${unread.join(', ')}`);
     this.#setCondition('commands-unavailable', null);
     this.#applyCommandState();
     // The adapter can close while the initial reads are in flight.
@@ -724,8 +805,12 @@ class Ad4qMonitoringAdapter {
     const client = this.commands;
     this.commands = null;
     if (client?.connected) {
-      // the unit keeps streaming SAMPLE lines to every client until the rate is set back to 0
-      for (let c = 1; c <= this.channels; c += 1) await client.setMeterRate(c, 0).catch(() => {});
+      // the unit keeps streaming SAMPLE lines to every client until the rate is set back to 0: the resets go
+      // out together and are given a few seconds in all, not one timeout per channel on a unit that is gone
+      await Promise.race([
+        Promise.allSettled(Array.from({ length: this.channels }, (_, i) => client.setMeterRate(i + 1, 0))),
+        delay(METER_RESET_MS),
+      ]);
     }
     await client?.close();
   }
@@ -798,9 +883,7 @@ class Ad4qMonitoringAdapter {
   #lost(unit, err) {
     if (this.closed || unit !== this.unit) return;
     if (Date.now() > this.restartExpectedUntil) {
-      const until = recordLoss(this.device?.id);
-      if (until) this.log('warn', `${this.host}: the unit dropped the session twice in ${LOSS_WINDOW_MS / 60_000} minutes; standing down until ${new Date(until).toISOString()} so it is not driven into another restart`);
-      this.#fatal(err);
+      this.#unexpectedLoss(err);
       return;
     }
     this.log('info', `the unit dropped the session (${err.message}); waiting for it to restart`);
@@ -811,6 +894,8 @@ class Ad4qMonitoringAdapter {
         this.reconnectWanted = false;
         await this.#reconnect();
       }
+      // the unit is fully back (or given up on): a drop from here on is not the restart
+      this.restartExpectedUntil = 0;
     })()
       .catch((err) => this.#fatal(err))
       .finally(() => {
@@ -824,15 +909,18 @@ class Ad4qMonitoringAdapter {
     const old = this.unit;
     this.unit = null;
     await old?.close();
+    // the window the HD write opened holds until the unit is fully back: a drop while the state is being
+    // re-read (the unit going down once more, or a join that landed as it went) is ridden out too, and
+    // the window is not reopened by it, so a unit that never settles is still given up on
     const deadline = this.restartExpectedUntil;
     while (!this.closed) {
-      const unit = await this.#newUnit();
+      const unit = await this.#newUnit({ fromAdvert: true });
       try {
         await unit.connect();
       } catch (err) {
         await unit.close();
         if (Date.now() > deadline) {
-          this.#fatal(new Error(`the unit did not come back after restarting: ${err.message}`));
+          this.#unexpectedLoss(new Error(`the unit did not come back after restarting: ${err.message}`));
           return;
         }
         await delay(RECONNECT_GAP_MS);
@@ -843,14 +931,18 @@ class Ad4qMonitoringAdapter {
         return;
       }
       this.unit = unit;
-      this.restartExpectedUntil = 0;
       try {
         await this.#refresh({ initial: true });
+        if (!unit.connected || this.reconnectWanted) throw new Error('the unit dropped the session again');
         this.live = true;
         await unit.subscribeAll();
       } catch (err) {
         // the session died while it was being rebuilt (a second restart): the loop goes round again
         this.log('info', `the rebuilt session was lost (${err.message})`);
+        if (Date.now() > deadline) {
+          this.#unexpectedLoss(new Error(`the unit did not settle after restarting: ${err.message}`));
+          return;
+        }
         this.reconnectWanted = true;
         return;
       }
@@ -869,13 +961,18 @@ class Ad4qMonitoringAdapter {
 
   async #refresh({ initial = false } = {}) {
     if (this.refreshing) return this.refreshing;
-    if (!this.unit?.connected) return null;
+    const unit = this.unit;
+    if (!unit?.connected) return null;
     this.refreshing = (async () => {
-      const all = await this.unit.readAll();
-      if (this.closed) return;
+      const all = await unit.readAll();
+      if (this.closed || unit !== this.unit) return;
       const answered = Object.keys(all.device).length + Object.values(all.channels).reduce((n, c) => n + Object.keys(c).length, 0);
       if (answered === 0) {
-        this.#fatal(new Error(`the AD4Q at ${this.host} stopped answering`));
+        const err = new Error(`the AD4Q at ${this.host} stopped answering`);
+        // on a session's first read the open (or the rebuild) fails; later it is a loss like a dropped
+        // session, ridden out inside a restart window and counted towards the stand-down outside one
+        if (initial) throw err;
+        this.#lost(unit, err);
         return;
       }
       Object.assign(this.state.device, all.device);
@@ -1058,7 +1155,7 @@ class Ad4qMonitoringAdapter {
     const channelScoped = new Set([
       'mute', 'gain', 'frequency', 'channelName', 'toneLevel', 'toneFrequency',
       'frequencyDiversity', 'overloadHold', 'interferenceAvoidance', 'unregisteredTransmitter', 'toneGenerator',
-      'transmitterPower', 'unlinkTransmitter', ...TALK_BY_PROPERTY.keys(),
+      'transmitterPower', 'unlinkTransmitter', 'antenna', ...SYNC_IDS, ...TALK_BY_PROPERTY.keys(),
     ]);
     if (channelScoped.has(propertyId) && (!Number.isInteger(channelIndex) || channelIndex < 1 || channelIndex > this.channels)) {
       throw new HttpError(400, 'unknown_channel', `${propertyId} is per channel; channelIndex must be 1..${this.channels}`);
@@ -1098,8 +1195,8 @@ class Ad4qMonitoringAdapter {
         target = ['channel', 'frequencyMhz', khzToMhz(quantizeKhz(clampKhz(mhzToKhz(value))))];
         break;
       case 'channelName':
-        if (typeof value !== 'string' || !/^[\x20-\x7e]*$/.test(value)) throw badValue(propertyId, 'printable ASCII text');
-        target = ['channel', 'name', value.slice(0, CHANNEL_NAME_MAX)];
+        if (typeof value !== 'string') throw badValue(propertyId, 'text');
+        target = ['channel', 'name', asciiName(value, CHANNEL_NAME_MAX)];
         break;
       case 'toneLevel': {
         if (value === 'Off' || value === null) target = ['channel', 'toneLevelDb', null];
@@ -1138,8 +1235,8 @@ class Ad4qMonitoringAdapter {
         break;
       }
       case 'deviceName':
-        if (typeof value !== 'string' || !/^[\x20-\x7e]*$/.test(value)) throw badValue(propertyId, 'printable ASCII text');
-        target = ['device', 'name', value.slice(0, DEVICE_NAME_MAX)];
+        if (typeof value !== 'string') throw badValue(propertyId, 'text');
+        target = ['device', 'name', asciiName(value, DEVICE_NAME_MAX)];
         break;
       case 'fanMode': {
         const mode = oneOf(value, FAN_MODES);
@@ -1226,7 +1323,12 @@ class Ad4qMonitoringAdapter {
       else if (scope === 'antenna') held = await unit.setAntenna(channelIndex, encoded);
       else {
         // unlink: the slot is cleared on the unit, and what it reported last is no longer true
-        await unit.unlinkSlot(channelIndex, encoded);
+        const kept = await unit.unlinkSlot(channelIndex, encoded);
+        if (kept) {
+          // the unit kept the slot: nothing changed, and the card goes on showing what it holds
+          this.log('warn', `${propertyId} on channel ${channelIndex}: the unit still holds slot ${encoded} (${kept.serial})`);
+          return;
+        }
         const ch = this.state.channels[channelIndex];
         // channel maps merge, so "nothing" must be published, not left out
         if (ch?.lastSync?.slot === encoded) ch.lastSync = { slot: null, serial: null, model: null };
@@ -1249,15 +1351,23 @@ class Ad4qMonitoringAdapter {
     }
     if (scope === 'talk') ((this.state.channels[channelIndex] ??= {}).talk ??= {})[key] = held;
     else if (scope === 'channel' || scope === 'antenna') (this.state.channels[channelIndex] ??= {})[key] = held;
-    else this.state.device[key] = held;
+    else if (scope === 'encryption') {
+      // one setting for the unit: every channel now holds what channel 1 read back
+      for (let c = 1; c <= this.channels; c += 1) (this.state.channels[c] ??= {}).encryption = held;
+    } else this.state.device[key] = held;
     this.#emitAll();
   }
 }
 
-// a unit found by SLP carries its component id, which a manual add does not
+// a unit found by SLP carries its component id and port in its config (see `discoveredDevice`); a manual
+// add has neither, and the unit is found from its advert when it is opened
 const deviceCid = (device) => {
   const cid = String(device?.config?.cid ?? '').replace(/[^0-9a-f]/gi, '').toLowerCase();
   return cid.length === 32 ? cid : null;
+};
+const devicePort = (device) => {
+  const port = Number(device?.config?.port);
+  return Number.isInteger(port) && port > 0 && port < 65536 ? port : undefined;
 };
 
 // ---------------------------------------------------------------------------
@@ -1303,6 +1413,7 @@ class Ad4qSpectrumAdapter {
     this.reconnectWanted = false;
     this.relimiting = null;
     this.band = null;
+    this.failed = false;
     // assigned by the shell before open()
     this.onWarnings = null;
     this.onFatal = null;
@@ -1340,7 +1451,7 @@ class Ad4qSpectrumAdapter {
         requestTimeoutMs: 1000,
       };
     } else {
-      options = { ...options, cid: deviceCid(this.device), browser: ensureBrowser(this.pluginConfig) };
+      options = { ...options, cid: deviceCid(this.device), port: devicePort(this.device), browser: ensureBrowser(this.pluginConfig) };
     }
     const unit = new Ad4qDevice(options);
     unit.on('lost', (err) => this.#lost(unit, err));
@@ -1419,18 +1530,22 @@ class Ad4qSpectrumAdapter {
   }
 
   #fatal(err) {
-    if (this.closed) return;
+    if (this.closed || this.failed) return;
+    this.failed = true;
     this.log('error', err.message);
     this.onFatal?.(err);
   }
 
   /**
    * The session dropped. A unit says goodbye only when it is restarting (an HD mode change, from
-   * anywhere), so that is waited out and the session reopened; anything else is a fault.
+   * anywhere), so that is waited out and the session reopened; anything else is a fault, counted
+   * with the monitoring adapter's losses so a unit that keeps failing is stood down.
    */
   #lost(unit, err) {
     if (this.closed || unit !== this.unit) return;
     if (!/ended the session/.test(err.message)) {
+      const until = recordLoss(this.device?.id);
+      if (until) this.log('warn', `${this.host}: standing down until ${new Date(until).toISOString()}`);
       this.#fatal(err);
       return;
     }
@@ -1456,7 +1571,8 @@ class Ad4qSpectrumAdapter {
     await old?.close();
     const deadline = Date.now() + RESTART_WINDOW_MS;
     while (!this.closed) {
-      const unit = new Ad4qDevice(this.unitOptions);
+      // after a restart the unit's fresh advert is the word that it is back (see the monitoring adapter's #newUnit)
+      const unit = new Ad4qDevice(this.unitOptions.browser ? { ...this.unitOptions, cid: null } : this.unitOptions);
       unit.on('lost', (e) => this.#lost(unit, e));
       unit.on('prop', (change) => this.#onProp(change));
       try {
