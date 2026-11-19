@@ -47,18 +47,22 @@ export function resolveInterface(selector) {
 }
 
 /**
- * The local interface that reaches `host`: the one whose subnet holds it, else `preferred` (the
- * adapter the plugin is set to use) when given, else (a unit on a link-local or unrouted address)
- * the first interface on the same kind of network, else the first interface there is.
+ * The local interface that reaches `host`: `preferred` (the adapter the plugin is set to use) when
+ * its subnet holds the unit, else the first interface whose subnet does, else `preferred` anyway,
+ * else (a unit on a link-local or unrouted address) the first interface on the same kind of
+ * network, else the first interface there is. On a wide subnet (a /14, say) a computer's Wi-Fi and
+ * wired port often both hold the unit's address, which is why the chosen adapter is asked first.
  */
 export function localInterfaceFor(host, preferred = null) {
   const interfaces = localInterfaces();
   if (host === '127.0.0.1') return { name: 'lo0', address: '127.0.0.1', netmask: '255.0.0.0' };
   const target = toInt(host);
-  const onSubnet = interfaces.find((i) => {
+  const holds = (i) => {
     const mask = toInt(i.netmask);
     return (toInt(i.address) & mask) === (target & mask);
-  });
+  };
+  if (preferred?.netmask && holds(preferred)) return preferred;
+  const onSubnet = interfaces.find(holds);
   if (onSubnet) return onSubnet;
   if (preferred) return preferred;
   const linkLocal = host.startsWith('169.254.');

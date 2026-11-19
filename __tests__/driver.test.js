@@ -721,6 +721,12 @@ test('the browse can be held to chosen adapters, and moves when the choice chang
     // a unit no adapter's subnet holds is reached through the chosen adapter; a unit on a subnet through that one
     assert.equal(localInterfaceFor('203.0.113.9', real), real);
     assert.equal(localInterfaceFor('203.0.113.9', null)?.address, localInterfaces()[0].address);
+    // on a wide subnet two adapters may both hold the unit: the chosen one wins, whatever the OS lists first
+    const wide = { name: 'chosen0', address: real.address, netmask: '255.252.0.0' };
+    const octets = real.address.split('.').map(Number);
+    const neighbour = `${octets[0]}.${(octets[1] & 0xfc) | 3}.200.7`;
+    assert.equal(localInterfaceFor(neighbour, wide), wide, 'the chosen adapter holds the unit');
+    assert.equal(localInterfaceFor(real.address, wide), wide);
   }
   assert.equal(resolveInterface('no-such-adapter0'), null);
   assert.equal(resolveInterface('198.51.100.1'), null);
